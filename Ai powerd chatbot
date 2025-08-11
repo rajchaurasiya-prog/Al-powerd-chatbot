@@ -1,0 +1,234 @@
+import sqlite3
+import time
+import threading
+from typing import List, Optional
+from fastapi import FastAPI, HTTPException, Form
+from pydantic import BaseModel
+from sentence_transformers import SentenceTransformer, util
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+import torch
+import nltk
+import numpy as np
+import os
+
+# Ensure NLTK resources
+nltk.download("punkt", quiet=True)
+
+DB_PATH = "chatbot.db"
+EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"  # compact & fast
+GEN_MODEL_NAME = "microsoft/DialoGPT-small"  # fallback generator
+CONTEXT_WINDOW = 6  # last 6 messages (user+bot) for context
+RETRIEVAL_THRESHOLD = 0.6  # similarity threshold to use retrieval answer
+
+app = FastAPI(title="Hybrid FAQ + Generative Chatbot")
+
+# Load embedding model (once)
+embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+
+# Load generator model (DialoGPT). Use pipeline for simplicity.
+device = 0 if torch.cuda.is_available() else -1
+gen_tokenizer = AutoTokenizer.from_pretrained(GEN_MODEL_NAME)
+gen_model = AutoModelForCausalLM.from_pretrained(GEN_MODEL_NAME)
+generator = pipeline("text-generation", model=gen_model, tokenizer=gen_tokenizer, device=device)
+
+# In-memory vector cache (faq_id -> vector). Will be built from DB at startup.
+faq_vectors = {}
+faq_texts = {}  # faq_id -> (question, answer)
+
+
+# --- DB helpers ---------------------------------------------------------
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS faqs (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               question TEXT NOT NULL,
+               answer TEXT NOT NULL,
+               created_ts REAL NOT NULL
+           )"""
+    )
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS logs (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               conversation_id TEXT,
+               role TEXT, -- 'user' or 'bot'
+               text TEXT,
+               ts REAL
+           )"""
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_add_faq(question: str, answer: str) -> int:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO faqs (question, answer, created_ts) VALUES (?, ?, ?)", (question, answer, time.time()))
+    fid = c.lastrowid
+    conn.commit()
+    conn.close()
+    return fid
+
+
+def db_get_all_faqs():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT id, question, answer FROM faqs")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def db_log(conversation_id: str, role: str, text: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO logs (conversation_id, role, text, ts) VALUES (?, ?, ?, ?)",
+              (conversation_id, role, text, time.time()))
+    conn.commit()
+    conn.close()
+
+
+def db_get_logs(conversation_id: Optional[str] = None, limit: int = 100):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    if conversation_id:
+        c.execute("SELECT role, text, ts FROM logs WHERE conversation_id = ? ORDER BY ts DESC LIMIT ?",
+                  (conversation_id, limit))
+    else:
+        c.execute("SELECT conversation_id, role, text, ts FROM logs ORDER BY ts DESC LIMIT ?", (limit,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+# --- Embedding index helpers -------------------------------------------
+def rebuild_faq_index():
+    """Load all FAQs from DB and compute embeddings (updates faq_vectors & faq_texts)."""
+    global faq_vectors, faq_texts
+    rows = db_get_all_faqs()
+    if not rows:
+        faq_vectors = {}
+        faq_texts = {}
+        return
+
+    ids = [r[0] for r in rows]
+    questions = [r[1] for r in rows]
+    answers = {r[0]: r[2] for r in rows}
+    # Using question+answer for embedding can help; we embed question only to match queries better
+    vectors = embed_model.encode(questions, convert_to_tensor=True, show_progress_bar=False)
+    faq_vectors = {fid: vectors[i] for i, fid in enumerate(ids)}
+    faq_texts = {fid: (questions[i], answers[fid]) for i, fid in enumerate(ids)}
+
+
+# Rebuild index at startup
+init_db()
+rebuild_faq_index()
+
+
+def preprocess(text: str) -> str:
+    # Lowercase & simple sentence tokenize join. Keep it simple; sentence-transformers handles raw text well.
+    sents = nltk.sent_tokenize(text)
+    return " ".join(sents).strip()
+
+
+
+def get_recent_context(conversation_id: str, max_turns: int = CONTEXT_WINDOW) -> List[str]:
+    rows = db_get_logs(conversation_id=conversation_id, limit=max_turns * 2)  # user+bot
+    # rows come back newest-first; reverse and format
+    rows = list(reversed(rows))
+    ctx = []
+    for role, text, ts in rows:
+        prefix = "User: " if role == "user" else "Bot: "
+        ctx.append(prefix + text)
+    return ctx
+
+
+def retrieve_answer(user_text: str):
+    if not faq_vectors:
+        return None, 0.0, None  # no faqs available
+
+    q_emb = embed_model.encode(preprocess(user_text), convert_to_tensor=True)
+    # compute cosine similarities
+    corpus_embs = list(faq_vectors.values())
+    ids = list(faq_vectors.keys())
+    similarities = util.cos_sim(q_emb, corpus_embs)[0]  # tensor
+    # get best
+    best_idx = int(torch.argmax(similarities).item())
+    best_score = float(similarities[best_idx].item())
+    best_id = ids[best_idx]
+    question, answer = faq_texts[best_id]
+    return answer, best_score, {"faq_id": best_id, "faq_question": question}
+
+def generate_reply(conversation_id: str, user_text: str, max_length=150):
+    # Build prompt from recent context
+    ctx = get_recent_context(conversation_id)
+    ctx_text = "\n".join(ctx[-CONTEXT_WINDOW:]) if ctx else ""
+    prompt = (ctx_text + "\nUser: " + user_text + "\nBot:") if ctx_text else ("User: " + user_text + "\nBot:")
+    # generation
+    gen_out = generator(prompt, max_length=len(gen_tokenizer(prompt)["input_ids"]) + 60, do_sample=True, top_k=50, num_return_sequences=1)
+    text = gen_out[0]["generated_text"]
+    # The pipeline returns full text; we only need the portion after the last "Bot:" marker
+    if "Bot:" in text:
+        reply = text.split("Bot:")[-1].strip()
+    else:
+        reply = text.strip()
+    # Simple truncation to a single reply line
+    return reply.split("\n")[0].strip()
+
+class ChatRequest(BaseModel):
+    conversation_id: str
+    message: str
+
+
+class ChatResponse(BaseModel):
+    conversation_id: str
+    reply: str
+    source: str  # "retrieval" or "generator"
+    confidence: float
+@app.post("/chat", response_model=ChatResponse)
+def chat(req: ChatRequest):
+    conv = req.conversation_id
+    user_msg = req.message.strip()
+    if not user_msg:
+        raise HTTPException(status_code=400, detail="Empty message")
+
+    db_log(conv, "user", user_msg)
+
+    # 1) Try retrieval
+    answer, score, meta = retrieve_answer(user_msg)
+    if answer and score >= RETRIEVAL_THRESHOLD:
+        db_log(conv, "bot", answer)
+        return ChatResponse(conversation_id=conv, reply=answer, source="retrieval", confidence=score)
+
+    # 2) Generative fallback
+    reply = generate_reply(conv, user_msg)
+    # safety note: for production do hallucination control & content filters
+    db_log(conv, "bot", reply)
+    return ChatResponse(conversation_id=conv, reply=reply, source="generator", confidence=float(score))
+
+
+@app.post("/admin/add_faq")
+def add_faq(question: str = Form(...), answer: str = Form(...)):
+    fid = db_add_faq(question.strip(), answer.strip())
+    # Rebuild index in background thread for responsiveness
+    threading.Thread(target=rebuild_faq_index, daemon=True).start()
+    return {"status": "ok", "faq_id": fid}
+
+
+@app.get("/admin/faqs")
+def list_faqs():
+    rows = db_get_all_faqs()
+    return [{"id": r[0], "question": r[1], "answer": r[2]} for r in rows]
+
+
+@app.get("/admin/logs")
+def get_logs(conv_id: Optional[str] = None, limit: int = 100):
+    rows = db_get_logs(conversation_id=conv_id, limit=limit)
+    # format
+    return rows
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "faqs_count": len(faq_vectors)}
+
