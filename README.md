@@ -65,3 +65,7 @@ This chatbot is a **hybrid FAQ and conversational assistant** built using **Natu
   * Falls back to conversational AI for non-FAQ questions.
   * Keeps a history of interactions for analytics or improvements.
 * Suitable for **customer service**, **website support**, or **internal helpdesk bots**.
+
+
+Output:
+<img width="1024" height="1024" alt="Image" src="https://github.com/user-attachments/assets/4baa8ae3-c578-40d5-8cc3-1dc1759559e3" />
