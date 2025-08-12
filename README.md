@@ -68,4 +68,3 @@ This chatbot is a **hybrid FAQ and conversational assistant** built using **Natu
 
 
 Output:
-<img width="1024" height="1024" alt="Image" src="https://github.com/user-attachments/assets/4baa8ae3-c578-40d5-8cc3-1dc1759559e3" />
